@@ -11,7 +11,7 @@ fn spot_is_unspecified_extra_sample_and_keeps_its_polarity() {
             let image = Image::from_raw(3, 1, layout, SampleType::U8, pixels.clone()).unwrap();
             let spot = [255, 127, 0]; // Photoshop: no ink, partial ink, full ink.
             let opts = EncodeOptions { tiff_compression: compression, ..Default::default() };
-            let bytes = photocraft_codecs::encode_tiff_rgb_spot(&image, &spot, &opts).unwrap();
+            let bytes = photocraft_codecs::encode_tiff_spot(&image, &spot, &opts).unwrap();
             let mut raw = Decoder::new(Cursor::new(&bytes)).unwrap();
             assert_eq!(raw.get_tag_u16_vec(Tag::ExtraSamples).unwrap(), if alpha { vec![2, 0] } else { vec![0] });
             assert_eq!(raw.get_tag_u32(Tag::SamplesPerPixel).unwrap(), if alpha { 5 } else { 4 });
@@ -26,10 +26,10 @@ fn spot_is_unspecified_extra_sample_and_keeps_its_polarity() {
 #[test]
 fn invalid_spot_buffers_are_errors() {
     let rgb = Image::from_raw(1, 1, ChannelLayout::Rgb, SampleType::U8, vec![1, 2, 3]).unwrap();
-    assert!(photocraft_codecs::encode_tiff_rgb_spot(&rgb, &[], &Default::default()).is_err());
-    assert!(photocraft_codecs::encode_tiff_rgb_spot(&rgb, &[1, 2], &Default::default()).is_err());
+    assert!(photocraft_codecs::encode_tiff_spot(&rgb, &[], &Default::default()).is_err());
+    assert!(photocraft_codecs::encode_tiff_spot(&rgb, &[1, 2], &Default::default()).is_err());
     let gray = Image::from_raw(1, 1, ChannelLayout::Gray, SampleType::U8, vec![1]).unwrap();
-    assert!(photocraft_codecs::encode_tiff_rgb_spot(&gray, &[1], &Default::default()).is_err());
+    assert!(photocraft_codecs::encode_tiff_spot(&gray, &[1], &Default::default()).is_err());
 }
 
 #[test]

@@ -211,10 +211,14 @@ pub(crate) fn export_layered(doc: &Document, opts: &ExportOptions, ctl: &photocr
     // while its real layer data is a small fraction of that; it is not used here. PSB-style data
     // is written only past 30000 px, when asked for, or when a length really overflows 32 bits.
     let force_psb = opts.force_psb || big;
+    // A CMYK document with a spot channel is a print plate: the composite is matted on paper so
+    // the plate can take the TIFF's one extra sample (Photoshop's "Save Transparency" off).
+    let cmyk_spot_doc =
+        doc.mode == ColorMode::Cmyk && doc.channels.len() == 1 && doc.channels.first().is_some_and(|c| c.spot.is_some()) && doc.quick_mask.is_none();
     let psd_opts = PsdExportOptions {
         force_psb,
         size_limit_psb: false,
-        merged_matte: false,
+        merged_matte: cmyk_spot_doc,
         merged_compression: Compression::Raw,
         maximize_compatibility: true,
         document_path: opts.document_path.clone(),
@@ -236,6 +240,31 @@ pub(crate) fn export_layered(doc: &Document, opts: &ExportOptions, ctl: &photocr
     ctl.check().map_err(|_| IoError::Cancelled)?;
     warnings.extend(w);
     let order = if codecs::tiff_writes_little_endian() { ByteOrder::Little } else { ByteOrder::Big };
+    let fmt = doc.pixel_format();
+    let cc = fmt.mode.color_channels();
+    let merged_alpha = file.layer_info.as_ref().is_some_and(|l| l.merged_alpha);
+    let file_channels = cc + usize::from(merged_alpha);
+    let extra = usize::from(file.header.channels).saturating_sub(file_channels);
+    let write_spot = matches!(fmt.mode, ColorMode::Rgb | ColorMode::Cmyk)
+        && extra == 1
+        && doc.channels.len() == 1
+        && doc.channels.first().is_some_and(|c| c.spot.is_some())
+        && doc.quick_mask.is_none();
+    // CMYK + transparency + a spot channel would be six samples, which neither Photoshop nor a
+    // print RIP reads. The plate is the print intent, so the transparency gives way: the
+    // composite is already matted on paper and its alpha plane is dropped here. RGB keeps the
+    // transparency instead and stores both samples ([2, 0]).
+    let drop_alpha_for_spot = write_spot && fmt.mode == ColorMode::Cmyk && merged_alpha;
+    // The extra sample is the plate, not a merged transparency: the layer data must not claim
+    // one, or Photoshop reads the plate as the document's transparency channel.
+    if drop_alpha_for_spot && let Some(info) = &mut file.layer_info {
+        info.merged_alpha = false;
+    }
+    let has_alpha = merged_alpha && !drop_alpha_for_spot;
+    let channels = cc + usize::from(has_alpha);
+    if extra > 0 && !write_spot {
+        warnings.push(format!("{extra} alpha channel(s) are not written to TIFF (one transparency channel only)"));
+    }
     let (layers, w) = match ImageSourceData::from_psd(&file).to_bytes(order) {
         Err(photocraft_psd::PsdError::LimitExceeded(_)) if !force_psb => {
             let psb_opts = PsdExportOptions { force_psb: true, ..psd_opts };
@@ -244,6 +273,9 @@ pub(crate) fn export_layered(doc: &Document, opts: &ExportOptions, ctl: &photocr
             warnings.extend(w);
             warnings.push("layer data exceeds 4 GB; written with PSB-sized lengths, which some readers do not open".into());
             file = psb;
+            if drop_alpha_for_spot && let Some(info) = &mut file.layer_info {
+                info.merged_alpha = false;
+            }
             ImageSourceData::from_psd(&file).to_bytes(order)?
         }
         r => r?,
@@ -254,22 +286,19 @@ pub(crate) fn export_layered(doc: &Document, opts: &ExportOptions, ctl: &photocr
     // The profile and XMP are written as TIFF tags, not as resources. EXIF stays a resource
     // (1058), which the PSD importer reads back unchanged; a block rebuilt from the TIFF's own
     // Exif directory keeps only the Exif, GPS and descriptive tags.
-    let resources: Vec<ImageResource> = file.resources.iter().filter(|r| !matches!(r.id, ids::ICC_PROFILE | ids::XMP)).cloned().collect();
-    let resources = resources_to_bytes(&resources)?;
-
-    let fmt = doc.pixel_format();
-    let cc = fmt.mode.color_channels();
-    let has_alpha = file.layer_info.as_ref().is_some_and(|l| l.merged_alpha);
-    let channels = cc + usize::from(has_alpha);
-    let extra = usize::from(file.header.channels).saturating_sub(channels);
-    let write_spot = fmt.mode == ColorMode::Rgb
-        && extra == 1
-        && doc.channels.len() == 1
-        && doc.channels.first().is_some_and(|c| c.spot.is_some())
-        && doc.quick_mask.is_none();
-    if extra > 0 && !write_spot {
-        warnings.push(format!("{extra} alpha channel(s) are not written to TIFF (one transparency channel only)"));
+    let mut resources: Vec<ImageResource> = file.resources.iter().filter(|r| !matches!(r.id, ids::ICC_PROFILE | ids::XMP)).cloned().collect();
+    // Channel names (1006 / 1045) and DisplayInfo (1077) describe the samples past the colour
+    // channels, in order. With the plate in the first extra sample, the merged transparency's
+    // records must go: Photoshop would otherwise name that sample "Transparency" and show it as
+    // an alpha channel instead of the spot ink.
+    if drop_alpha_for_spot && let Some(spot) = doc.channels.first() {
+        resources.retain(|r| !matches!(r.id, 1006 | 1045 | crate::channel_map::DISPLAY_INFO));
+        let names = [spot.name.as_str()];
+        resources.push(ImageResource::new(1006, crate::psd_export::pascal_names_resource(&names)));
+        resources.push(ImageResource::new(1045, crate::psd_export::unicode_names_resource(&names)));
+        resources.push(ImageResource::new(crate::channel_map::DISPLAY_INFO, crate::channel_map::display_info(&[spot], false)));
     }
+    let resources = resources_to_bytes(&resources)?;
     let sample = csample(fmt.sample);
     let (w, h) = (doc.size.width, doc.size.height);
     let cmyk = fmt.mode == ColorMode::Cmyk;
@@ -297,7 +326,7 @@ pub(crate) fn export_layered(doc: &Document, opts: &ExportOptions, ctl: &photocr
             .checked_mul(h as usize)
             .and_then(|n| n.checked_mul(sample.bytes()))
             .ok_or_else(|| IoError::Unsupported("spot plane size overflow".into()))?;
-        let at = channels.checked_mul(plane_bytes).ok_or_else(|| IoError::Unsupported("spot offset overflow".into()))?;
+        let at = file_channels.checked_mul(plane_bytes).ok_or_else(|| IoError::Unsupported("spot offset overflow".into()))?;
         let spot = file.image_data.data.get(at..at.saturating_add(plane_bytes)).ok_or_else(|| IoError::Unsupported("missing spot channel pixels".into()))?;
         let mut native = spot.to_vec();
         if cfg!(target_endian = "little") {
@@ -305,7 +334,7 @@ pub(crate) fn export_layered(doc: &Document, opts: &ExportOptions, ctl: &photocr
                 value.reverse();
             }
         }
-        let bytes = codecs::encode_tiff_rgb_spot(&img, &native, &opts.encode)?;
+        let bytes = codecs::encode_tiff_spot(&img, &native, &opts.encode)?;
         return Ok(ExportResult { bytes, warnings });
     }
     encode_image(&img, Format::Tiff, opts, warnings)

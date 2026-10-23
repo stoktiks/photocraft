@@ -1109,6 +1109,12 @@ custom_colortype!(RgbExtra32F, f32, PI::RGB, &[32; 4], &[SampleFormat::IEEEFP; 4
 custom_colortype!(RgbSpot8, u8, PI::RGB, &[8; 5], &[SampleFormat::Uint; 5], int);
 custom_colortype!(RgbSpot16, u16, PI::RGB, &[16; 5], &[SampleFormat::Uint; 5], int);
 custom_colortype!(RgbSpot32F, f32, PI::RGB, &[32; 5], &[SampleFormat::IEEEFP; 5], float);
+// CMYK plus one unspecified (spot) sample: the layout a print RIP reads as the white-ink
+// plate, and what Photoshop writes when a CMYK document with a spot channel is saved without
+// transparency.
+custom_colortype!(CmykSpot8, u8, PI::CMYK, &[8; 5], &[SampleFormat::Uint; 5], int);
+custom_colortype!(CmykSpot16, u16, PI::CMYK, &[16; 5], &[SampleFormat::Uint; 5], int);
+custom_colortype!(CmykSpot32F, f32, PI::CMYK, &[32; 5], &[SampleFormat::IEEEFP; 5], float);
 custom_colortype!(GrayA8, u8, PI::BlackIsZero, &[8, 8], &[SampleFormat::Uint; 2], int);
 custom_colortype!(GrayA16, u16, PI::BlackIsZero, &[16, 16], &[SampleFormat::Uint; 2], int);
 custom_colortype!(GrayA32F, f32, PI::BlackIsZero, &[32, 32], &[SampleFormat::IEEEFP; 2], float);
@@ -1240,9 +1246,16 @@ fn write_image<K: TiffKind>(enc: &mut TiffEncoder<&mut Cursor<Vec<u8>>, K>, img:
 
 fn write_spot<K: TiffKind>(enc: &mut TiffEncoder<&mut Cursor<Vec<u8>>, K>, img: &Image, data: &[u8], tags: &TagSet<'_>) -> tiff::TiffResult<()> {
     let (w, h) = img.dimensions();
+    let cmyk = img.layout().is_cmyk();
+    if cmyk && tags.alpha {
+        // Six samples: the format allows it, Photoshop and the print RIPs do not read it.
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "a CMYK spot TIFF cannot also carry transparency").into());
+    }
     match img.sample_type() {
         SampleType::U8 => {
-            if tags.alpha {
+            if cmyk {
+                write_one::<CmykSpot8, K>(enc, w, h, data, tags)
+            } else if tags.alpha {
                 write_one::<RgbSpot8, K>(enc, w, h, data, tags)
             } else {
                 write_one::<RgbExtra8, K>(enc, w, h, data, tags)
@@ -1250,11 +1263,23 @@ fn write_spot<K: TiffKind>(enc: &mut TiffEncoder<&mut Cursor<Vec<u8>>, K>, img: 
         }
         SampleType::U16 => {
             let samples: Vec<u16> = data.as_chunks::<2>().0.iter().map(|b| u16::from_ne_bytes(*b)).collect();
-            if tags.alpha { write_one::<RgbSpot16, K>(enc, w, h, &samples, tags) } else { write_one::<RgbExtra16, K>(enc, w, h, &samples, tags) }
+            if cmyk {
+                write_one::<CmykSpot16, K>(enc, w, h, &samples, tags)
+            } else if tags.alpha {
+                write_one::<RgbSpot16, K>(enc, w, h, &samples, tags)
+            } else {
+                write_one::<RgbExtra16, K>(enc, w, h, &samples, tags)
+            }
         }
         SampleType::F32 => {
             let samples: Vec<f32> = data.as_chunks::<4>().0.iter().map(|b| f32::from_ne_bytes(*b)).collect();
-            if tags.alpha { write_one::<RgbSpot32F, K>(enc, w, h, &samples, tags) } else { write_one::<RgbExtra32F, K>(enc, w, h, &samples, tags) }
+            if cmyk {
+                write_one::<CmykSpot32F, K>(enc, w, h, &samples, tags)
+            } else if tags.alpha {
+                write_one::<RgbSpot32F, K>(enc, w, h, &samples, tags)
+            } else {
+                write_one::<RgbExtra32F, K>(enc, w, h, &samples, tags)
+            }
         }
         _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "unsupported spot sample depth").into()),
     }
@@ -1279,11 +1304,17 @@ pub(crate) fn encode(src: &Image, plan: Plan, opts: &EncodeOptions) -> Result<Ve
     encode_impl(&img, opts, None)
 }
 
-/// Encodes RGB, optional straight alpha, and one spot plate. `extra` is a single
-/// sample plane, with one sample per pixel in the same native sample type as `src`.
-pub(crate) fn encode_rgb_spot(src: &Image, extra: &[u8], opts: &EncodeOptions) -> Result<Vec<u8>, CodecError> {
-    if !src.layout().is_rgb() || src.sample_type() == SampleType::F16 {
-        return Err(CodecError::unsupported(F, "spot TIFF requires RGB/RGBA at 8, 16 or 32 bits"));
+/// Encodes RGB or CMYK, optionally with straight alpha (RGB only), and one spot plate.
+/// `extra` is a single sample plane, with one sample per pixel in the same native sample type
+/// as `src`.
+pub(crate) fn encode_spot(src: &Image, extra: &[u8], opts: &EncodeOptions) -> Result<Vec<u8>, CodecError> {
+    let cmyk = src.layout().is_cmyk();
+    if (!src.layout().is_rgb() && !cmyk) || src.sample_type() == SampleType::F16 {
+        return Err(CodecError::unsupported(F, "spot TIFF requires RGB, RGBA, CMYK or CMYKA at 8, 16 or 32 bits"));
+    }
+    if cmyk && src.layout().has_alpha() {
+        // CMYK + transparency + spot is six samples: not a layout Photoshop or a RIP reads.
+        return Err(CodecError::unsupported(F, "a CMYK spot TIFF cannot also carry transparency"));
     }
     let bytes = src.sample_type().bytes();
     let count = src.pixel_count();
